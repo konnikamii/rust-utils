@@ -1,5 +1,6 @@
 use clap::{Parser, Subcommand};
 use colored::Colorize;
+use colored::control;
 use std::env;
 use std::error::Error;
 use std::fs::{OpenOptions, read_to_string, write};
@@ -8,7 +9,7 @@ use std::process::Command;
 
 #[derive(Parser, Debug)]
 #[command(name = "env")]
-#[command(version, about = "Cli tool to manage environment variables".bold().blue().to_string(), long_about = None)]
+#[command(version, about = "Cli tool to manage environment variables".bold().white().to_string(), long_about = None)]
 #[command()]
 struct Args {
     /// Only show variables containing this substring (in key or value)
@@ -59,6 +60,8 @@ enum Commands {
 }
 
 fn main() {
+    control::set_virtual_terminal(true).unwrap();
+
     if let Err(e) = run() {
         eprintln!("env: {e}");
         std::process::exit(1);
@@ -175,7 +178,7 @@ fn run() -> Result<(), Box<dyn Error>> {
     };
 
     for (k, v) in filtered {
-        println!("{}={}", k.green(), v);
+        println!("{}={}", k.green().bold().on_black().to_string(), v);
     }
 
     // If a command was provided, run it with the modified environment
