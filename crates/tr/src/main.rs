@@ -1,5 +1,5 @@
 use clap::Parser;
-use colored::Colorize;
+use colored::{Colorize, control};
 use std::env;
 use std::fs;
 use std::io::{self, Write};
@@ -54,6 +54,8 @@ struct Args {
 }
 
 fn main() {
+    control::set_virtual_terminal(true).unwrap();
+
     if let Err(e) = run() {
         eprintln!("tree: {e}");
         std::process::exit(1);
