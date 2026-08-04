@@ -45,12 +45,16 @@ struct Args {
     no_sort: bool,
 
     /// Show only folders (hide files)
-    #[arg(short = 'F', long)]
+    #[arg(short = 'o', long)]
     folders_only: bool,
 
     /// Remove Colors from output
     #[arg(short = 'c', long)]
     clean: bool,
+
+    /// Filter entries by comma-separated substrings in filename (e.g. ".txt,log")
+    #[arg(short = 'F', long = "filter")]
+    filter: Option<String>,
 }
 
 fn main() {
@@ -134,6 +138,65 @@ struct TreeEntry {
     children: Vec<TreeEntry>,
 }
 
+// Highlight occurrences of filter patterns within a name.
+fn highlight_name_with_style<F>(name: &str, args: &Args, base_style: F) -> String
+where
+    F: Fn(&str) -> colored::ColoredString,
+{
+    if args.clean {
+        return if name.is_empty() {
+            String::new()
+        } else {
+            name.to_string()
+        };
+    }
+
+    let filt = match &args.filter {
+        Some(f) => f,
+        None => return base_style(name).to_string(),
+    };
+
+    let patterns: Vec<&str> = filt
+        .split(',')
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    if patterns.is_empty() {
+        return base_style(name).to_string();
+    }
+
+    let mut out = String::new();
+    let mut remaining = name;
+
+    while !remaining.is_empty() {
+        // find earliest match among patterns
+        let mut best: Option<(usize, &str)> = None;
+        for &pat in &patterns {
+            if let Some(idx) = remaining.find(pat) {
+                match best {
+                    Some((bidx, _)) if idx < bidx => best = Some((idx, pat)),
+                    None => best = Some((idx, pat)),
+                    _ => {}
+                }
+            }
+        }
+
+        if let Some((idx, pat)) = best {
+            if idx > 0 {
+                out.push_str(&base_style(&remaining[..idx]).to_string());
+            }
+            out.push_str(&remaining[idx..idx + pat.len()].red().to_string());
+            remaining = &remaining[idx + pat.len()..];
+        } else {
+            out.push_str(&base_style(remaining).to_string());
+            break;
+        }
+    }
+
+    out
+}
+
 fn build_tree(path: &Path, depth: usize, args: &Args) -> io::Result<Vec<TreeEntry>> {
     if depth >= args.depth {
         return Ok(Vec::new());
@@ -210,9 +273,16 @@ fn build_entry(
         }
     }
 
+    // Print directory if any children matches filters
+    let final_should_print = if is_dir {
+        should_print || children.iter().any(|c| c.should_print)
+    } else {
+        should_print
+    };
+
     Ok(TreeEntry {
         name,
-        should_print,
+        should_print: final_should_print,
         is_dir,
         is_exec,
         is_hidden,
@@ -244,8 +314,21 @@ fn read_visible_entries(path: &Path, args: &Args) -> io::Result<Vec<(fs::DirEntr
         // - no hidden files (by . or by name)
         // - no symlinks
         // - folders_only hides files
-        let should_print =
+        let mut should_print =
             !hidden_by_dot && !hidden_by_name && !is_symlink && !(args.folders_only && !is_dir);
+
+        // Apply substring filter
+        if let Some(ref filt) = args.filter {
+            let patterns: Vec<&str> = filt
+                .split(',')
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .collect();
+            if !patterns.is_empty() {
+                let name_matches = patterns.iter().any(|pat| name.contains(pat));
+                should_print = should_print && name_matches;
+            }
+        }
 
         entries.push((entry, should_print));
     }
@@ -263,20 +346,24 @@ fn render_tree(entries: &[TreeEntry], prefix: &str, args: &Args) {
         let connector = if is_last { "└── " } else { "├── " };
 
         let file_name = if entry.is_dir {
+            // highlight matches inside directory name but keep directory color for non-matching parts
             if !args.clean {
-                format!("{}/", entry.name).blue().bold().to_string()
+                let h = highlight_name_with_style(&entry.name, args, |s| s.blue().bold());
+                format!("{}/", h)
             } else {
                 format!("{}/", entry.name)
             }
         } else if entry.is_exec {
             if !args.clean {
-                entry.name.green().bold().to_string()
+                let h = highlight_name_with_style(&entry.name, args, |s| s.green().bold());
+                h
             } else {
                 entry.name.clone()
             }
         } else if entry.is_hidden {
             if !args.clean {
-                entry.name.dimmed().to_string()
+                let h = highlight_name_with_style(&entry.name, args, |s| s.dimmed());
+                h
             } else {
                 entry.name.clone()
             }
@@ -287,15 +374,17 @@ fn render_tree(entries: &[TreeEntry], prefix: &str, args: &Args) {
                 .unwrap_or_else(|| "unknown".to_string());
 
             if !args.clean {
-                format!("{} -> {target}", entry.name)
-                    .cyan()
-                    .bold()
-                    .to_string()
+                let name_h = highlight_name_with_style(&entry.name, args, |s| s.cyan().bold());
+                format!("{} -> {target}", name_h)
             } else {
                 format!("{} -> {target}", entry.name)
             }
         } else {
-            entry.name.clone()
+            if !args.clean {
+                highlight_name_with_style(&entry.name, args, |s| s.normal())
+            } else {
+                entry.name.clone()
+            }
         };
 
         let size = if args.folder_sizes && entry.is_dir {
