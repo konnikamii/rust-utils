@@ -85,14 +85,11 @@ fn run() -> io::Result<()> {
         display_path = stripped.to_string();
     }
 
-    println!(
-        "{}",
-        if !args.clean {
-            display_path.blue().bold()
-        } else {
-            display_path.normal()
-        },
-    );
+    let name_display = if !args.clean {
+        display_path.blue().bold().to_string()
+    } else {
+        display_path.clone()
+    };
 
     // Spinner while scanning/building the tree
     let spinner_running = Arc::new(AtomicBool::new(true));
@@ -118,6 +115,34 @@ fn run() -> io::Result<()> {
 
     spinner_running.store(false, Ordering::Relaxed);
     let _ = spinner_handle.join();
+
+    // Print summary for the main folder (where command was invoked) when requested
+    if args.folder_sizes || args.file_count {
+        // top-level child count is already represented by `tree.len()` (built from read_visible_entries)
+        let root_child_count = tree.len();
+
+        // total size is sum of top-level entries' total_size
+        let root_total_size: u64 = tree.iter().map(|e| e.total_size).sum();
+
+        let size_str = if args.folder_sizes {
+            format!(
+                "{} ",
+                format!("{:>8}", human_size(root_total_size)).bright_green()
+            )
+        } else {
+            String::new()
+        };
+
+        let count_str = if args.file_count {
+            format!(" ({})", root_child_count)
+        } else {
+            String::new()
+        };
+
+        println!("{}{}{}", size_str, name_display, count_str);
+    } else {
+        println!("{}", name_display);
+    }
 
     render_tree(&tree, " ", &args);
 
