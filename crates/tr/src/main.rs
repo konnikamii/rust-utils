@@ -218,7 +218,6 @@ where
             break;
         }
     }
-
     out
 }
 
@@ -230,12 +229,18 @@ fn build_tree(path: &Path, depth: usize, args: &Args) -> io::Result<Vec<TreeEntr
     let mut entries = read_visible_entries(path, args)?;
 
     if !args.no_sort {
-        entries.sort_by_key(|(e, _)| e.file_name());
+        entries.sort_by_key(|(e, _, _)| e.file_name());
     }
 
     let mut tree = Vec::with_capacity(entries.len());
-    for (entry, should_print) in entries {
-        tree.push(build_entry(entry, should_print, depth, args)?);
+    for (entry, should_print, hidden_by_name) in entries {
+        tree.push(build_entry(
+            entry,
+            should_print,
+            hidden_by_name,
+            depth,
+            args,
+        )?);
     }
 
     Ok(tree)
@@ -244,6 +249,7 @@ fn build_tree(path: &Path, depth: usize, args: &Args) -> io::Result<Vec<TreeEntr
 fn build_entry(
     entry: fs::DirEntry,
     should_print: bool,
+    hidden_by_name: bool,
     depth: usize,
     args: &Args,
 ) -> io::Result<TreeEntry> {
@@ -274,21 +280,48 @@ fn build_entry(
     let mut children = Vec::new();
 
     if is_dir {
-        let should_read_children = depth + 1 < args.depth || args.file_count || args.folder_sizes;
+        // Only read into a directory's entries when needed. We avoid scanning
+        // hidden parent directories unless the user explicitly requested folder
+        // sizes or file counts. This prevents hidden parents from leaking their
+        // children into the output and avoids unnecessary IO when not required.
+        let should_read_children = if hidden_by_name {
+            args.filter.is_some() || args.folder_sizes || args.file_count
+        } else {
+            args.file_count
+                || args.folder_sizes
+                || (should_print && depth + 1 < args.depth)
+                || args.filter.is_some()
+        };
+
         if should_read_children {
-            let mut child_entries = read_visible_entries(&path, args)?; // Vec<(DirEntry, should_print)>
+            // read_visible_entries now returns (DirEntry, should_print, hidden_by_name)
+            let mut child_entries = read_visible_entries(&path, args)?;
 
             child_count = child_entries.len();
 
             if !args.no_sort {
-                child_entries.sort_by_key(|(e, _)| e.file_name());
+                child_entries.sort_by_key(|(e, _, _)| e.file_name());
             }
 
-            let should_recurse = depth + 1 < args.depth || args.folder_sizes;
+            // Recurse when we need to compute sizes or when the requested depth
+            // allows storing children for rendering. If a filter is active we
+            // should recurse so matching descendants can be found.
+            let should_recurse = args.folder_sizes
+                || (should_print && depth + 1 < args.depth)
+                || args.filter.is_some();
             if should_recurse {
-                let should_store_children = depth + 1 < args.depth;
-                for (child, child_should_print) in child_entries {
-                    let child_node = build_entry(child, child_should_print, depth + 1, args)?;
+                // Only store children for rendering when the parent is visible
+                // or when a filter is active (we need the path to matching items).
+                let should_store_children =
+                    depth + 1 < args.depth && (should_print || args.filter.is_some());
+                for (child, child_should_print, child_hidden_by_name) in child_entries {
+                    let child_node = build_entry(
+                        child,
+                        child_should_print,
+                        child_hidden_by_name,
+                        depth + 1,
+                        args,
+                    )?;
                     total_size += child_node.total_size;
                     if should_store_children {
                         children.push(child_node);
@@ -298,9 +331,19 @@ fn build_entry(
         }
     }
 
-    // Print directory if any children matches filters
+    // If the directory itself is hidden (should_print == false), then hide
+    // everything under it as well unless the user explicitly requested
+    // folder sizes or file counts. This ensures hidden parents don't leak
+    // child entries into the rendered tree.
     let final_should_print = if is_dir {
-        should_print || children.iter().any(|c| c.should_print)
+        // When a filter is active, a directory that was hidden by `-x` may
+        // need to be shown because a descendant matches the filter. In
+        // non-filtered mode, hidden directories remain hidden.
+        if !should_print && args.filter.is_none() {
+            false
+        } else {
+            should_print || children.iter().any(|c| c.should_print)
+        }
     } else {
         should_print
     };
@@ -320,42 +363,46 @@ fn build_entry(
     })
 }
 
-fn read_visible_entries(path: &Path, args: &Args) -> io::Result<Vec<(fs::DirEntry, bool)>> {
+fn read_visible_entries(path: &Path, args: &Args) -> io::Result<Vec<(fs::DirEntry, bool, bool)>> {
     let mut entries = Vec::new();
 
     for entry in fs::read_dir(path)?.filter_map(Result::ok) {
-        // When `--all` is set, it takes priority and we show everything.
-        if args.all {
-            entries.push((entry, true));
-            continue;
-        }
         let name = entry.file_name().to_string_lossy().to_string();
-        let hidden_by_dot = name.starts_with('.');
+        // Dot-based hidden files are normally hidden; `-a` disables that
+        // behavior but should NOT disable explicit name-based hiding (-x).
+        let mut hidden_by_dot = name.starts_with('.');
+        if args.all {
+            hidden_by_dot = false;
+        }
+
         let hidden_by_name = args.hide_name.iter().any(|n| n == &name);
         let is_symlink = entry.file_type().map(|t| t.is_symlink()).unwrap_or(false);
         let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
 
-        // Determine should_print according to existing logic;
-        // - no hidden files (by . or by name)
-        // - no symlinks
-        // - folders_only hides files
-        let mut should_print =
-            !hidden_by_dot && !hidden_by_name && !is_symlink && !(args.folders_only && !is_dir);
+        // Base visibility (ignoring hide-by-name for filter handling)
+        let base_visible = !hidden_by_dot && !is_symlink && !(args.folders_only && !is_dir);
 
-        // Apply substring filter
-        if let Some(ref filt) = args.filter {
+        // Determine should_print according to logic;
+        // - when a filter is active, only entries matching the filter are
+        //   marked for printing (but we still scan into hidden-by-name dirs to
+        //   find matches). When no filter is active, hide_name (-x) always
+        //   suppresses the entry.
+        let should_print = if let Some(ref filt) = args.filter {
             let patterns: Vec<&str> = filt
                 .split(',')
                 .map(|s| s.trim())
                 .filter(|s| !s.is_empty())
                 .collect();
-            if !patterns.is_empty() {
-                let name_matches = patterns.iter().any(|pat| name.contains(pat));
-                should_print = should_print && name_matches;
+            if patterns.is_empty() {
+                false
+            } else {
+                base_visible && patterns.iter().any(|pat| name.contains(pat))
             }
-        }
+        } else {
+            base_visible && !hidden_by_name
+        };
 
-        entries.push((entry, should_print));
+        entries.push((entry, should_print, hidden_by_name));
     }
 
     Ok(entries)
