@@ -112,9 +112,19 @@ fn run() -> Result<(), Box<dyn Error>> {
         None => {}
     }
 
-    // Load variables from .env file if provided
-    if let Some(file) = &args.file {
-        let content = read_to_string(file)?;
+    // Decide which .env file to load: explicit `-f` takes precedence. If no file
+    // was provided but a command is being executed, auto-load `./.env` when
+    // it exists so users don't have to pass `-f .env` every time.
+    let file_to_load: Option<String> = if let Some(f) = &args.file {
+        Some(f.clone())
+    } else if !args.command.is_empty() && std::path::Path::new(".env").exists() {
+        Some(".env".to_string())
+    } else {
+        None
+    };
+
+    if let Some(file) = file_to_load {
+        let content = read_to_string(&file)?;
         for line in content.lines() {
             let trimmed = line.trim();
             if trimmed.is_empty() || trimmed.starts_with('#') {
@@ -125,8 +135,10 @@ fn run() -> Result<(), Box<dyn Error>> {
                 l = &l[7..];
             }
             if let Some((k, v)) = parse_name_value(l) {
+                // Expand any ${VAR} or $VAR references using the current environment
+                let expanded = expand_vars(&v);
                 unsafe {
-                    env::set_var(&k, &v);
+                    env::set_var(&k, &expanded);
                 }
             } else {
                 eprintln!("warning: ignoring invalid line in {}: {}", file, trimmed);
@@ -137,8 +149,9 @@ fn run() -> Result<(), Box<dyn Error>> {
     // Apply temporary sets first (only affects this process and its children)
     for s in &args.set {
         if let Some((k, v)) = parse_name_value(s) {
+            let expanded = expand_vars(&v);
             unsafe {
-                env::set_var(&k, &v);
+                env::set_var(&k, &expanded);
             }
         } else {
             eprintln!(
@@ -151,7 +164,8 @@ fn run() -> Result<(), Box<dyn Error>> {
     // Apply persistent sets (platform-specific)
     for p in &args.persist {
         if let Some((k, v)) = parse_name_value(p) {
-            if let Err(e) = persist_var(&k, &v) {
+            let expanded = expand_vars(&v);
+            if let Err(e) = persist_var(&k, &expanded) {
                 eprintln!("failed to persist {}: {}", k, e);
             }
         } else {
@@ -177,8 +191,13 @@ fn run() -> Result<(), Box<dyn Error>> {
         vars
     };
 
-    for (k, v) in filtered {
-        println!("{}={}", k.green().bold().on_black().to_string(), v);
+    // Only print variables when not executing a command; when a command is
+    // provided we should not dump variables to stdout (so the child process
+    // receives a clean stdout).
+    if args.command.is_empty() {
+        for (k, v) in filtered {
+            println!("{}={}", k.green().bold().on_black().to_string(), v);
+        }
     }
 
     // If a command was provided, run it with the modified environment
@@ -244,6 +263,70 @@ fn parse_name_value(s: &str) -> Option<(String, String)> {
     };
 
     Some((name, value))
+}
+
+/// Expand `$VAR` and `${VAR}` occurrences using the current environment.
+fn expand_vars(input: &str) -> String {
+    let mut out = input.to_string();
+    // Iterate a few times to allow variables that reference other variables
+    for _ in 0..10 {
+        let mut changed = false;
+        let mut i = 0;
+        let chars: Vec<char> = out.chars().collect();
+        let mut buf = String::with_capacity(chars.len());
+
+        while i < chars.len() {
+            if chars[i] == '$' {
+                if i + 1 < chars.len() && chars[i + 1] == '{' {
+                    // ${VAR}
+                    let mut j = i + 2;
+                    while j < chars.len() && chars[j] != '}' {
+                        j += 1;
+                    }
+                    if j < chars.len() && chars[j] == '}' {
+                        let name: String = chars[i + 2..j].iter().collect();
+                        let val = env::var(&name).unwrap_or_default();
+                        buf.push_str(&val);
+                        i = j + 1;
+                        changed = true;
+                        continue;
+                    } else {
+                        // no closing brace, treat literal
+                        buf.push(chars[i]);
+                        i += 1;
+                        continue;
+                    }
+                } else {
+                    // $VAR style
+                    let mut j = i + 1;
+                    while j < chars.len() && (chars[j].is_ascii_alphanumeric() || chars[j] == '_') {
+                        j += 1;
+                    }
+                    if j > i + 1 {
+                        let name: String = chars[i + 1..j].iter().collect();
+                        let val = env::var(&name).unwrap_or_default();
+                        buf.push_str(&val);
+                        i = j;
+                        changed = true;
+                        continue;
+                    } else {
+                        buf.push(chars[i]);
+                        i += 1;
+                        continue;
+                    }
+                }
+            } else {
+                buf.push(chars[i]);
+                i += 1;
+            }
+        }
+
+        if !changed {
+            return buf;
+        }
+        out = buf;
+    }
+    out
 }
 
 fn persist_var(name: &str, value: &str) -> Result<(), Box<dyn Error>> {
