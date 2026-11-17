@@ -1,5 +1,6 @@
 use clap::Parser;
 use colored::{Colorize, control};
+use rayon::prelude::*;
 use std::env;
 use std::fs;
 use std::io::{self, Write};
@@ -9,6 +10,7 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 use std::thread;
+use std::time::Instant;
 
 #[derive(Parser, Debug)]
 struct Args {
@@ -92,6 +94,7 @@ fn run() -> io::Result<()> {
     };
 
     // Spinner while scanning/building the tree
+    let scan_start = Instant::now();
     let spinner_running = Arc::new(AtomicBool::new(true));
     let spinner_flag = spinner_running.clone();
     let spinner_handle = thread::spawn(move || {
@@ -101,7 +104,8 @@ fn run() -> io::Result<()> {
         let mut handle = stdout.lock();
         while spinner_flag.load(Ordering::Relaxed) {
             let ch = spinner[i % spinner.len()];
-            print!("\rScanning... {}", ch);
+            let elapsed = scan_start.elapsed().as_secs_f64();
+            print!("\rScanning... {} {:.1}s", ch, elapsed);
             let _ = handle.flush();
             i = i.wrapping_add(1);
             thread::sleep(std::time::Duration::from_millis(80));
@@ -145,6 +149,13 @@ fn run() -> io::Result<()> {
     }
 
     render_tree(&tree, " ", &args);
+
+    let total = format!("\nDone in {:.2}s", scan_start.elapsed().as_secs_f64());
+    if args.clean {
+        println!("{total}");
+    } else {
+        println!("{}", total.dimmed());
+    }
 
     Ok(())
 }
@@ -229,19 +240,17 @@ fn build_tree(path: &Path, depth: usize, args: &Args) -> io::Result<Vec<TreeEntr
     let mut entries = read_visible_entries(path, args)?;
 
     if !args.no_sort {
-        entries.sort_by_key(|(e, _, _)| e.file_name());
+        entries.sort_by_cached_key(|(e, _, _)| e.file_name());
     }
 
-    let mut tree = Vec::with_capacity(entries.len());
-    for (entry, should_print, hidden_by_name) in entries {
-        tree.push(build_entry(
-            entry,
-            should_print,
-            hidden_by_name,
-            depth,
-            args,
-        )?);
-    }
+    // Build entries in parallel; `collect` keeps the original (sorted) order.
+    // Entries we can't access are skipped instead of aborting the whole scan.
+    let tree = entries
+        .into_par_iter()
+        .filter_map(|(entry, should_print, hidden_by_name)| {
+            build_entry(entry, should_print, hidden_by_name, depth, args).ok()
+        })
+        .collect();
 
     Ok(tree)
 }
@@ -295,12 +304,14 @@ fn build_entry(
 
         if should_read_children {
             // read_visible_entries now returns (DirEntry, should_print, hidden_by_name)
-            let mut child_entries = read_visible_entries(&path, args)?;
+            // Unreadable directories (e.g. access denied) are treated as empty
+            // instead of aborting the whole scan.
+            let mut child_entries = read_visible_entries(&path, args).unwrap_or_default();
 
             child_count = child_entries.len();
 
             if !args.no_sort {
-                child_entries.sort_by_key(|(e, _, _)| e.file_name());
+                child_entries.sort_by_cached_key(|(e, _, _)| e.file_name());
             }
 
             // Recurse when we need to compute sizes or when the requested depth
@@ -314,18 +325,25 @@ fn build_entry(
                 // or when a filter is active (we need the path to matching items).
                 let should_store_children =
                     depth + 1 < args.depth && (should_print || args.filter.is_some());
-                for (child, child_should_print, child_hidden_by_name) in child_entries {
-                    let child_node = build_entry(
-                        child,
-                        child_should_print,
-                        child_hidden_by_name,
-                        depth + 1,
-                        args,
-                    )?;
-                    total_size += child_node.total_size;
-                    if should_store_children {
-                        children.push(child_node);
-                    }
+                // Scan children in parallel (rayon work-stealing handles the
+                // nested recursion). Order is preserved; inaccessible entries
+                // are skipped.
+                let nodes: Vec<TreeEntry> = child_entries
+                    .into_par_iter()
+                    .filter_map(|(child, child_should_print, child_hidden_by_name)| {
+                        build_entry(
+                            child,
+                            child_should_print,
+                            child_hidden_by_name,
+                            depth + 1,
+                            args,
+                        )
+                        .ok()
+                    })
+                    .collect();
+                total_size += nodes.iter().map(|n| n.total_size).sum::<u64>();
+                if should_store_children {
+                    children = nodes;
                 }
             }
         }
@@ -366,6 +384,14 @@ fn build_entry(
 fn read_visible_entries(path: &Path, args: &Args) -> io::Result<Vec<(fs::DirEntry, bool, bool)>> {
     let mut entries = Vec::new();
 
+    // Parse filter patterns once per directory instead of once per entry.
+    let patterns: Option<Vec<&str>> = args.filter.as_ref().map(|filt| {
+        filt.split(',')
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .collect()
+    });
+
     for entry in fs::read_dir(path)?.filter_map(Result::ok) {
         let name = entry.file_name().to_string_lossy().to_string();
         // Dot-based hidden files are normally hidden; `-a` disables that
@@ -387,12 +413,7 @@ fn read_visible_entries(path: &Path, args: &Args) -> io::Result<Vec<(fs::DirEntr
         //   marked for printing (but we still scan into hidden-by-name dirs to
         //   find matches). When no filter is active, hide_name (-x) always
         //   suppresses the entry.
-        let should_print = if let Some(ref filt) = args.filter {
-            let patterns: Vec<&str> = filt
-                .split(',')
-                .map(|s| s.trim())
-                .filter(|s| !s.is_empty())
-                .collect();
+        let should_print = if let Some(ref patterns) = patterns {
             if patterns.is_empty() {
                 false
             } else {

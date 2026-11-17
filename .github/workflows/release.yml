@@ -1,0 +1,98 @@
+name: Release
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_type:
+        description: "Version bump type"
+        required: true
+        default: "patch"
+        type: choice
+        options:
+          - patch
+          - minor
+          - major
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    # The tools use Windows-only console APIs, so build on Windows.
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          fetch-depth: 0
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      # Bumps the shared version in [workspace.package] (all crates inherit it).
+      # Nothing is pushed yet, so a failed build leaves no commit or tag behind.
+      - name: Bump version
+        id: bump
+        run: |
+          CURRENT=$(sed -n '/^\[workspace.package\]/,/^\[/ s/^version = "\(.*\)"/\1/p' Cargo.toml)
+          IFS=. read -r MAJOR MINOR PATCH <<< "$CURRENT"
+          case "${{ inputs.release_type }}" in
+            major) MAJOR=$((MAJOR + 1)); MINOR=0; PATCH=0 ;;
+            minor) MINOR=$((MINOR + 1)); PATCH=0 ;;
+            patch) PATCH=$((PATCH + 1)) ;;
+          esac
+          VERSION="$MAJOR.$MINOR.$PATCH"
+          sed -i "/^\[workspace.package\]/,/^\[/ s/^version = \".*\"/version = \"$VERSION\"/" Cargo.toml
+          echo "Bumping $CURRENT -> $VERSION"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Build release binaries
+        run: cargo build --workspace --release
+
+      - name: Package executables
+        id: package
+        run: |
+          VERSION="${{ steps.bump.outputs.version }}"
+          mkdir -p dist
+          for crate in crates/*/; do
+            name=$(basename "$crate")
+            if [ -f "target/release/$name.exe" ]; then
+              cp "target/release/$name.exe" dist/
+            fi
+          done
+          ZIP="rust-utils-v$VERSION-windows-x64.zip"
+          (cd dist && 7z a -tzip "../$ZIP" *.exe)
+          mv "$ZIP" dist/
+          ls -la dist
+
+      - name: Commit, tag, and push
+        run: |
+          VERSION="${{ steps.bump.outputs.version }}"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Cargo.toml Cargo.lock
+          git commit -m "chore(release): v$VERSION"
+          git tag "v$VERSION"
+          git push origin "HEAD:${{ github.event.repository.default_branch }}"
+          git push origin "v$VERSION"
+
+      - name: Create GitHub release with the executables
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VERSION="${{ steps.bump.outputs.version }}"
+          gh release create "v$VERSION" dist/* \
+            --title "v$VERSION" \
+            --generate-notes
