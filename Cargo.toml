@@ -6,7 +6,7 @@ members = ["crates/env",
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.1"
 
 [workspace.dependencies]
 chrono = "0.4"
