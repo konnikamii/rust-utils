@@ -1,16 +1,14 @@
 use clap::Parser;
 use colored::{Colorize, control};
-use rayon::prelude::*;
-use std::env;
-use std::fs;
-use std::io::{self, Write};
-use std::path::{Path, PathBuf};
+use std::io::{self, IsTerminal, Write};
+use std::path::PathBuf;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
 };
 use std::thread;
 use std::time::Instant;
+use tr::{ScanOptions, ScanProgress, TreeEntry};
 
 #[derive(Parser, Debug)]
 struct Args {
@@ -70,108 +68,116 @@ fn main() {
 
 fn run() -> io::Result<()> {
     let args = Args::parse();
-    let cwd = env::current_dir()?;
+    let opts = ScanOptions {
+        depth: args.depth,
+        all: args.all,
+        hide_names: args.hide_name.clone(),
+        folders_only: args.folders_only,
+        filter: filter_patterns(&args),
+        sort: !args.no_sort,
+        dir_sizes: args.folder_sizes,
+        count_children: args.file_count,
+        progress: Some(Arc::new(ScanProgress::default())),
+    };
 
-    let metadata = fs::symlink_metadata(&args.directory)?;
+    // Spinner while scanning; only on a terminal so piped output stays clean.
+    let scan_start = Instant::now();
+    let spinner_running = Arc::new(AtomicBool::new(true));
+    let spinner_handle = io::stdout().is_terminal().then(|| {
+        let spinner_flag = spinner_running.clone();
+        let progress = opts.progress.clone().unwrap_or_default();
+        let clean = args.clean;
+        thread::spawn(move || {
+            let spinner = ['|', '/', '-', '\\'];
+            let mut i: usize = 0;
+            let stdout = io::stdout();
+            let mut handle = stdout.lock();
+            while spinner_flag.load(Ordering::Relaxed) {
+                let ch = spinner[i % spinner.len()];
+                let elapsed = scan_start.elapsed().as_secs_f64();
+                let dir = shorten_middle(&progress.current_dir().display().to_string(), 70);
+                let dir = if clean { dir } else { dir.dimmed().to_string() };
+                // Clear the line each frame: the folder text changes length.
+                let _ = write!(handle, "\r\x1b[2KScanning... {ch} {elapsed:.1}s {dir}");
+                let _ = handle.flush();
+                i = i.wrapping_add(1);
+                thread::sleep(std::time::Duration::from_millis(80));
+            }
+            // clear the spinner line
+            let _ = write!(handle, "\r\x1b[2K");
+            let _ = handle.flush();
+        })
+    });
 
-    if !metadata.file_type().is_dir() {
-        println!("{} is a file", args.directory.display());
-        return Err(io::Error::new(io::ErrorKind::Other, "Invalid directory"));
+    let result = tr::scan(&args.directory, &opts);
+
+    spinner_running.store(false, Ordering::Relaxed);
+    if let Some(handle) = spinner_handle {
+        let _ = handle.join();
     }
+    let tree = result?;
 
-    // Print the directory tree
-    let start = cwd.join(&args.directory).canonicalize()?;
-    let mut display_path = start.display().to_string();
-
-    if let Some(stripped) = display_path.strip_prefix(r"\\?\") {
-        display_path = stripped.to_string();
-    }
-
+    let display_path = tree.root.display().to_string();
     let name_display = if !args.clean {
         display_path.blue().bold().to_string()
     } else {
-        display_path.clone()
+        display_path
     };
 
-    // Spinner while scanning/building the tree
-    let scan_start = Instant::now();
-    let spinner_running = Arc::new(AtomicBool::new(true));
-    let spinner_flag = spinner_running.clone();
-    let spinner_handle = thread::spawn(move || {
-        let spinner = ['|', '/', '-', '\\'];
-        let mut i: usize = 0;
-        let stdout = std::io::stdout();
-        let mut handle = stdout.lock();
-        while spinner_flag.load(Ordering::Relaxed) {
-            let ch = spinner[i % spinner.len()];
-            let elapsed = scan_start.elapsed().as_secs_f64();
-            print!("\rScanning... {} {:.1}s", ch, elapsed);
-            let _ = handle.flush();
-            i = i.wrapping_add(1);
-            thread::sleep(std::time::Duration::from_millis(80));
-        }
-        // clear the spinner line
-        print!("\r\x1b[2K");
-        let _ = handle.flush();
-    });
-
-    let tree = build_tree(&start, 0, &args)?;
-
-    spinner_running.store(false, Ordering::Relaxed);
-    let _ = spinner_handle.join();
-
     // Print summary for the main folder (where command was invoked) when requested
-    if args.folder_sizes || args.file_count {
-        // top-level child count is already represented by `tree.len()` (built from read_visible_entries)
-        let root_child_count = tree.len();
-
-        // total size is sum of top-level entries' total_size
-        let root_total_size: u64 = tree.iter().map(|e| e.total_size).sum();
-
-        let size_str = if args.folder_sizes {
-            format!(
-                "{} ",
-                format!("{:>8}", human_size(root_total_size)).bright_green()
-            )
-        } else {
-            String::new()
-        };
-
-        let count_str = if args.file_count {
-            format!(" ({})", root_child_count)
-        } else {
-            String::new()
-        };
-
-        println!("{}{}{}", size_str, name_display, count_str);
+    let size_str = if args.folder_sizes {
+        format!(
+            "{} ",
+            format!("{:>8}", human_size(tree.total_size)).bright_green()
+        )
     } else {
-        println!("{}", name_display);
+        String::new()
+    };
+    let count_str = if args.file_count {
+        format!(" ({})", tree.child_count)
+    } else {
+        String::new()
+    };
+    println!("{}{}{}", size_str, name_display, count_str);
+
+    render_tree(&tree.entries, " ", &args);
+
+    let mut done = format!("\nDone in {:.2}s", scan_start.elapsed().as_secs_f64());
+    // Without -S folders count as 0 bytes, so the total would be misleading.
+    if args.folder_sizes {
+        done.push_str(&format!(" · {} total", human_size(tree.total_size)));
     }
-
-    render_tree(&tree, " ", &args);
-
-    let total = format!("\nDone in {:.2}s", scan_start.elapsed().as_secs_f64());
     if args.clean {
-        println!("{total}");
+        println!("{done}");
     } else {
-        println!("{}", total.dimmed());
+        println!("{}", done.dimmed());
     }
 
     Ok(())
 }
 
-struct TreeEntry {
-    name: String,
-    should_print: bool,
-    is_dir: bool,
-    is_exec: bool,
-    is_hidden: bool,
-    is_symlink: bool,
-    symlink_target: Option<String>,
-    file_size: u64,
-    total_size: u64,
-    child_count: usize,
-    children: Vec<TreeEntry>,
+/// Fits `s` into `max` characters by replacing its middle with "…", keeping
+/// the start (drive / top folders) and the more telling end.
+fn shorten_middle(s: &str, max: usize) -> String {
+    let len = s.chars().count();
+    if len <= max {
+        return s.to_string();
+    }
+    let head_len = (max - 1) / 3;
+    let tail_len = max - 1 - head_len;
+    let head: String = s.chars().take(head_len).collect();
+    let tail: String = s.chars().skip(len - tail_len).collect();
+    format!("{head}…{tail}")
+}
+
+fn filter_patterns(args: &Args) -> Vec<String> {
+    args.filter
+        .iter()
+        .flat_map(|f| f.split(','))
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+        .collect()
 }
 
 // Highlight occurrences of filter patterns within a name.
@@ -232,209 +238,10 @@ where
     out
 }
 
-fn build_tree(path: &Path, depth: usize, args: &Args) -> io::Result<Vec<TreeEntry>> {
-    if depth >= args.depth {
-        return Ok(Vec::new());
-    }
-
-    let mut entries = read_visible_entries(path, args)?;
-
-    if !args.no_sort {
-        entries.sort_by_cached_key(|(e, _, _)| e.file_name());
-    }
-
-    // Build entries in parallel; `collect` keeps the original (sorted) order.
-    // Entries we can't access are skipped instead of aborting the whole scan.
-    let tree = entries
-        .into_par_iter()
-        .filter_map(|(entry, should_print, hidden_by_name)| {
-            build_entry(entry, should_print, hidden_by_name, depth, args).ok()
-        })
-        .collect();
-
-    Ok(tree)
-}
-
-fn build_entry(
-    entry: fs::DirEntry,
-    should_print: bool,
-    hidden_by_name: bool,
-    depth: usize,
-    args: &Args,
-) -> io::Result<TreeEntry> {
-    let path = entry.path();
-    let name = entry.file_name().to_string_lossy().to_string();
-    let metadata = entry.metadata()?;
-    let is_dir = metadata.is_dir();
-    let is_symlink = entry.file_type().map(|t| t.is_symlink()).unwrap_or(false);
-    let is_hidden = name.starts_with('.');
-    let is_exec = is_executable(&path, &metadata);
-    let symlink_target = if is_symlink {
-        Some(
-            fs::read_link(&path)
-                .map(|p| p.to_string_lossy().to_string())
-                .unwrap_or_else(|_| "unknown".to_string()),
-        )
-    } else {
-        None
-    };
-
-    let file_size = if metadata.is_file() {
-        metadata.len()
-    } else {
-        0
-    };
-    let mut total_size = file_size;
-    let mut child_count = 0;
-    let mut children = Vec::new();
-
-    if is_dir {
-        // Only read into a directory's entries when needed. We avoid scanning
-        // hidden parent directories unless the user explicitly requested folder
-        // sizes or file counts. This prevents hidden parents from leaking their
-        // children into the output and avoids unnecessary IO when not required.
-        let should_read_children = if hidden_by_name {
-            args.filter.is_some() || args.folder_sizes || args.file_count
-        } else {
-            args.file_count
-                || args.folder_sizes
-                || (should_print && depth + 1 < args.depth)
-                || args.filter.is_some()
-        };
-
-        if should_read_children {
-            // read_visible_entries now returns (DirEntry, should_print, hidden_by_name)
-            // Unreadable directories (e.g. access denied) are treated as empty
-            // instead of aborting the whole scan.
-            let mut child_entries = read_visible_entries(&path, args).unwrap_or_default();
-
-            child_count = child_entries.len();
-
-            if !args.no_sort {
-                child_entries.sort_by_cached_key(|(e, _, _)| e.file_name());
-            }
-
-            // Recurse when we need to compute sizes or when the requested depth
-            // allows storing children for rendering. If a filter is active we
-            // should recurse so matching descendants can be found.
-            let should_recurse = args.folder_sizes
-                || (should_print && depth + 1 < args.depth)
-                || args.filter.is_some();
-            if should_recurse {
-                // Only store children for rendering when the parent is visible
-                // or when a filter is active (we need the path to matching items).
-                let should_store_children =
-                    depth + 1 < args.depth && (should_print || args.filter.is_some());
-                // Scan children in parallel (rayon work-stealing handles the
-                // nested recursion). Order is preserved; inaccessible entries
-                // are skipped.
-                let nodes: Vec<TreeEntry> = child_entries
-                    .into_par_iter()
-                    .filter_map(|(child, child_should_print, child_hidden_by_name)| {
-                        build_entry(
-                            child,
-                            child_should_print,
-                            child_hidden_by_name,
-                            depth + 1,
-                            args,
-                        )
-                        .ok()
-                    })
-                    .collect();
-                total_size += nodes.iter().map(|n| n.total_size).sum::<u64>();
-                if should_store_children {
-                    children = nodes;
-                }
-            }
-        }
-    }
-
-    // If the directory itself is hidden (should_print == false), then hide
-    // everything under it as well unless the user explicitly requested
-    // folder sizes or file counts. This ensures hidden parents don't leak
-    // child entries into the rendered tree.
-    let final_should_print = if is_dir {
-        // When a filter is active, a directory that was hidden by `-x` may
-        // need to be shown because a descendant matches the filter. In
-        // non-filtered mode, hidden directories remain hidden.
-        if !should_print && args.filter.is_none() {
-            false
-        } else {
-            should_print || children.iter().any(|c| c.should_print)
-        }
-    } else {
-        should_print
-    };
-
-    Ok(TreeEntry {
-        name,
-        should_print: final_should_print,
-        is_dir,
-        is_exec,
-        is_hidden,
-        is_symlink,
-        symlink_target,
-        file_size,
-        total_size,
-        child_count,
-        children,
-    })
-}
-
-fn read_visible_entries(path: &Path, args: &Args) -> io::Result<Vec<(fs::DirEntry, bool, bool)>> {
-    let mut entries = Vec::new();
-
-    // Parse filter patterns once per directory instead of once per entry.
-    let patterns: Option<Vec<&str>> = args.filter.as_ref().map(|filt| {
-        filt.split(',')
-            .map(|s| s.trim())
-            .filter(|s| !s.is_empty())
-            .collect()
-    });
-
-    for entry in fs::read_dir(path)?.filter_map(Result::ok) {
-        let name = entry.file_name().to_string_lossy().to_string();
-        // Dot-based hidden files are normally hidden; `-a` disables that
-        // behavior but should NOT disable explicit name-based hiding (-x).
-        let mut hidden_by_dot = name.starts_with('.');
-        if args.all {
-            hidden_by_dot = false;
-        }
-
-        let hidden_by_name = args.hide_name.iter().any(|n| n == &name);
-        let is_symlink = entry.file_type().map(|t| t.is_symlink()).unwrap_or(false);
-        let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
-
-        // Base visibility (ignoring hide-by-name for filter handling)
-        let base_visible = !hidden_by_dot && !is_symlink && !(args.folders_only && !is_dir);
-
-        // Determine should_print according to logic;
-        // - when a filter is active, only entries matching the filter are
-        //   marked for printing (but we still scan into hidden-by-name dirs to
-        //   find matches). When no filter is active, hide_name (-x) always
-        //   suppresses the entry.
-        let should_print = if let Some(ref patterns) = patterns {
-            if patterns.is_empty() {
-                false
-            } else {
-                base_visible && patterns.iter().any(|pat| name.contains(pat))
-            }
-        } else {
-            base_visible && !hidden_by_name
-        };
-
-        entries.push((entry, should_print, hidden_by_name));
-    }
-
-    Ok(entries)
-}
-
 fn render_tree(entries: &[TreeEntry], prefix: &str, args: &Args) {
     let last = entries.len().saturating_sub(1);
 
     for (i, entry) in entries.iter().enumerate() {
-        // Visibility was computed during build; use the cached flag.
-
         let is_last = i == last;
         let connector = if is_last { "└── " } else { "├── " };
 
@@ -448,15 +255,13 @@ fn render_tree(entries: &[TreeEntry], prefix: &str, args: &Args) {
             }
         } else if entry.is_exec {
             if !args.clean {
-                let h = highlight_name_with_style(&entry.name, args, |s| s.green().bold());
-                h
+                highlight_name_with_style(&entry.name, args, |s| s.green().bold())
             } else {
                 entry.name.clone()
             }
         } else if entry.is_hidden {
             if !args.clean {
-                let h = highlight_name_with_style(&entry.name, args, |s| s.dimmed());
-                h
+                highlight_name_with_style(&entry.name, args, |s| s.dimmed())
             } else {
                 entry.name.clone()
             }
@@ -500,14 +305,8 @@ fn render_tree(entries: &[TreeEntry], prefix: &str, args: &Args) {
             String::new()
         };
 
-        if entry.should_print {
-            println!(
-                "{}{}{}{}{}",
-                prefix, connector, size, file_name, child_count
-            );
-        }
+        println!("{prefix}{connector}{size}{file_name}{child_count}");
 
-        // Always recurse into directories so sizes/counts include hidden entries.
         if entry.is_dir && !entry.children.is_empty() {
             let next_prefix = if is_last {
                 format!("{prefix}    ")
@@ -517,30 +316,6 @@ fn render_tree(entries: &[TreeEntry], prefix: &str, args: &Args) {
 
             render_tree(&entry.children, &next_prefix, args);
         }
-    }
-}
-
-fn is_executable(path: &Path, metadata: &fs::Metadata) -> bool {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-
-        metadata.is_file() && (metadata.permissions().mode() & 0o111 != 0)
-    }
-
-    #[cfg(windows)]
-    {
-        let _ = metadata;
-
-        let ext = path
-            .extension()
-            .and_then(|e| e.to_str())
-            .map(|e| e.to_ascii_lowercase());
-
-        matches!(
-            ext.as_deref(),
-            Some("exe") | Some("com") | Some("bat") | Some("cmd") | Some("ps1")
-        )
     }
 }
 

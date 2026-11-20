@@ -3,7 +3,17 @@ name = "tr"
 version.workspace = true
 edition = "2024"
 
+[features]
+default = ["cli"]
+# Dependencies only the `tr` binary needs. Library users: `default-features = false`.
+cli = ["dep:clap", "dep:colored"]
+
 [dependencies]
-clap.workspace = true
 rayon.workspace = true
-colored.workspace = true
+clap = { workspace = true, optional = true }
+colored = { workspace = true, optional = true }
+
+[[bin]]
+name = "tr"
+path = "src/main.rs"
+required-features = ["cli"]

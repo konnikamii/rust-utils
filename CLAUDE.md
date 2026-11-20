@@ -7,7 +7,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 A Cargo workspace of small, independent CLI tools, each a single binary crate under `crates/<name>/src/main.rs`:
 
 - `env` — view/filter env vars, load `.env` files, temporarily set (`-s`) or persist (`-p`, `set`/`append`/`remove` subcommands) variables, and run a command with the modified environment (args after `--`).
-- `tr` — `tree`-like directory viewer; scans directories in parallel with `rayon` (`build_tree` → `build_entry` → `render_tree`), with a spinner thread running during the scan.
+- `tr` — `tree`-like directory viewer. Lib + bin: the parallel `rayon` scanner lives in `src/lib.rs` (public `tr::scan(path, &ScanOptions) -> Tree`, used by the Lumen desktop app), and `src/main.rs` only does CLI args, spinner, and `render_tree`. CLI-only deps (clap, colored) sit behind the default `cli` feature, which the bin requires; library users set `default-features = false`.
 - `grep` — small recursive regex search (`walkdir` + `regex`), case-insensitive by default, reads stdin when no paths are given.
 
 The binary name equals the crate directory name. Release packaging depends on this (it copies `target/release/<crate-dir>.exe`).
@@ -22,12 +22,11 @@ cargo run -p env -- -F PATH
 cargo run -p grep -- "pattern" src -n
 cargo watch -w crates/tr -x "run -p tr"
 cargo clippy --workspace
-cargo test -p <crate> <test_name>   # no tests exist yet
+cargo test -p <crate> <test_name>   # only tr has tests (in lib.rs)
+cargo build -p tr --lib --no-default-features   # check the lib builds without CLI deps
 ```
 
-Note: the per-crate READMEs show `cargo run -- crates/<name> -- ...`, which is wrong; use `cargo run -p <name> -- ...`.
-
-`scripts/package_exes.ps1` builds release and zips all `.exe`s into `executables.zip` (gitignored) for local packaging.
+Use `cargo run -p <name> -- ...` (some older READMEs show the wrong `cargo run -- crates/<name> -- ...` form).
 
 ## Workspace conventions
 
